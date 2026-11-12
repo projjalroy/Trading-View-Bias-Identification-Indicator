@@ -1,0 +1,396 @@
+//@version=5
+indicator("ICT HTF Bias: ERL>IRL / IRL>ERL + LTF MSS/CISD", shorttitle="ICT Bias", overlay=true, max_boxes_count=100, max_lines_count=200, max_labels_count=200)
+
+// =====================================================================================
+//  METHOD
+//  Bias TF -> Confirmation TF  (from your alignment map)
+//     Monthly -> D1   (chain M5 > H1 > D1 > Monthly)
+//     Daily   -> H1
+//     Weekly  -> H4   (chain M1 > M15 > H4 > Weekly)
+//     H4      -> M15
+//
+//  ERL>IRL : Bias-TF swing low (SSL) / swing high (BSL) is swept  -> wait for bullish/bearish
+//            MSS or CISD on the confirmation TF -> bias confirmed -> DOL = recent FVG on bias TF
+//            in the direction of bias (fallback: opposite external swing).
+//  IRL>ERL : Price taps a bias-TF FVG (bull FVG = bullish, bear FVG = bearish) -> wait for
+//            MSS/CISD on the confirmation TF -> bias confirmed -> DOL = external liquidity
+//            (last bias-TF swing high for bullish / swing low for bearish).
+//
+//  Use the chart on a TF <= the confirmation TF (e.g. H1 or lower for Daily bias).
+// =====================================================================================
+
+// ------------------------------------- INPUTS ----------------------------------------
+G1 = "Model"
+modelIn = input.string("Both", "Liquidity model", options=["ERL>IRL", "IRL>ERL", "Both"], group=G1)
+confIn  = input.string("MSS or CISD", "Confirmation type", options=["MSS or CISD", "MSS only", "CISD only"], group=G1)
+expiryN = input.int(12, "Setup expiry (bias-TF bars)", minval=1, group=G1, tooltip="Armed setup is cancelled if no confirmation arrives within this many bias-TF bars.")
+biasLen = input.int(2, "Bias TF swing length (left = right)", minval=1, group=G1)
+confLen = input.int(2, "Confirmation TF swing length (for MSS)", minval=1, group=G1)
+
+G2 = "Modules (Bias TF -> Confirmation TF)"
+showMN = input.bool(true, "Monthly", inline="mn", group=G2)
+cfMN   = input.timeframe("D", "confirm on", inline="mn", group=G2)
+showW  = input.bool(true, "Weekly", inline="w", group=G2)
+cfW    = input.timeframe("240", "confirm on", inline="w", group=G2)
+showD  = input.bool(true, "Daily", inline="d", group=G2)
+cfD    = input.timeframe("60", "confirm on", inline="d", group=G2)
+showH4 = input.bool(true, "H4", inline="h4", group=G2)
+cfH4   = input.timeframe("15", "confirm on", inline="h4", group=G2)
+
+G3 = "Visuals"
+showLbl = input.bool(true, "Show labels", group=G3)
+showDol = input.bool(true, "Show DOL line / FVG box", group=G3)
+showTbl = input.bool(true, "Show dashboard", group=G3)
+tblPos  = input.string("Top Right", "Dashboard position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=G3)
+bullCol = input.color(#26a69a, "Bullish color", group=G3)
+bearCol = input.color(#ef5350, "Bearish color", group=G3)
+alertsOn = input.bool(true, "Enable alert() messages", group=G3)
+
+// ------------------------------- BIAS-TF ENGINE --------------------------------------
+// Runs on the bias TF. Returns swing levels + latest alive bullish/bearish FVG
+// (values of the last CLOSED bias-TF bar, so no repainting).
+f_bias(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    var float swH = na
+    var int   swHT = na
+    var float swL = na
+    var int   swLT = na
+    var float bTop = na
+    var float bBot = na
+    var int   bT = na
+    var int   bDone = na
+    var float sTop = na
+    var float sBot = na
+    var int   sT = na
+    var int   sDone = na
+    if not na(ph)
+        swH := ph
+        swHT := time[len]
+    if not na(pl)
+        swL := pl
+        swLT := time[len]
+    // an FVG dies when price CLOSES through it
+    if not na(bBot) and close < bBot
+        bTop := na
+        bBot := na
+        bT := na
+        bDone := na
+    if not na(sTop) and close > sTop
+        sTop := na
+        sBot := na
+        sT := na
+        sDone := na
+    // new FVGs (3-candle imbalance)
+    if low > high[2]
+        bTop := low
+        bBot := high[2]
+        bT := time[2]
+        bDone := time_close
+    if high < low[2]
+        sTop := low[2]
+        sBot := high
+        sT := time[2]
+        sDone := time_close
+    [swH[1], swHT[1], swL[1], swLT[1], bTop[1], bBot[1], bT[1], bDone[1], sTop[1], sBot[1], sT[1], sDone[1]]
+
+// --------------------------- CONFIRMATION-TF ENGINE ----------------------------------
+// MSS  = close breaks last swing high (bull) / swing low (bear)
+// CISD = close beyond the OPEN of the last opposing delivery run
+//        (bull: close > open of the last bearish candle run; bear: mirror)
+f_conf(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    var float lastH = na
+    var float lastL = na
+    var int mssBull = 0
+    var int mssBear = 0
+    var int cisdBull = 0
+    var int cisdBear = 0
+    var float bearOpen = na
+    var float bullOpen = na
+    if not na(ph)
+        lastH := ph
+    if not na(pl)
+        lastL := pl
+    if not na(lastH) and close > lastH
+        mssBull += 1
+        lastH := na
+    if not na(lastL) and close < lastL
+        mssBear += 1
+        lastL := na
+    bool isBear = close < open
+    bool isBull = close > open
+    bool prevBear = close[1] < open[1]
+    bool prevBull = close[1] > open[1]
+    if isBear and not prevBear
+        bearOpen := open
+    if isBull and not prevBull
+        bullOpen := open
+    if not na(bearOpen) and close > bearOpen
+        cisdBull += 1
+        bearOpen := na
+    if not na(bullOpen) and close < bullOpen
+        cisdBear += 1
+        bullOpen := na
+    [mssBull[1], mssBear[1], cisdBull[1], cisdBear[1]]
+
+f_tfName(string tf) =>
+    tf == "D" ? "D1" : tf == "W" ? "Weekly" : tf == "M" ? "Monthly" : tf == "240" ? "H4" : tf == "60" ? "H1" : tf == "15" ? "M15" : tf == "5" ? "M5" : tf == "1" ? "M1" : tf
+
+// ------------------------------------ MODULE -----------------------------------------
+f_module(string biasTF, string confTF, string nm, bool en) =>
+    [swH, swHT, swL, swLT, bTop, bBot, bT, bDone, sTop, sBot, sT, sDone] = request.security(syminfo.tickerid, biasTF, f_bias(biasLen), lookahead=barmerge.lookahead_on)
+    [mB, mS, cB, cS] = request.security(syminfo.tickerid, confTF, f_conf(confLen), lookahead=barmerge.lookahead_on)
+
+    bool tfOk = timeframe.in_seconds() <= timeframe.in_seconds(confTF)
+    bool evMssBull = nz(mB) != nz(mB[1])
+    bool evMssBear = nz(mS) != nz(mS[1])
+    bool evCisdBull = nz(cB) != nz(cB[1])
+    bool evCisdBear = nz(cS) != nz(cS[1])
+    bool bullMSS = confIn != "CISD only" and evMssBull
+    bool bearMSS = confIn != "CISD only" and evMssBear
+    bool bullCISD = confIn != "MSS only" and evCisdBull
+    bool bearCISD = confIn != "MSS only" and evCisdBear
+
+    var int bias = 0
+    var int armDir = 0
+    var string armModel = ""
+    var int armTime = 0
+    var float armExt = na
+    var float armInv = na
+    var int sweptLowT = 0
+    var int sweptHighT = 0
+    var int tapBullT = 0
+    var int tapBearT = 0
+    var float biasInv = na
+    var string biasModel = ""
+    var string note = ""
+    var float tgt = na
+    var line dolLine = na
+    var box dolBox = na
+    var label dolLbl = na
+    var float lastLvl = na
+    var float lastTop = na
+    float dLvl = na
+
+    if en and tfOk
+        bool useERL = modelIn != "IRL>ERL"
+        bool useIRL = modelIn != "ERL>IRL"
+        int biasMs = timeframe.in_seconds(biasTF) * 1000
+        int expiryMs = biasMs * expiryN
+
+        // 1) expire / cancel pending setups
+        if armDir != 0 and time - armTime > expiryMs
+            armDir := 0
+            note := "Setup expired"
+        if armDir == 1 and not na(armInv) and close < armInv
+            armDir := 0
+            note := "FVG disrespected"
+        if armDir == -1 and not na(armInv) and close > armInv
+            armDir := 0
+            note := "FVG disrespected"
+
+        // 2) invalidation / DOL reached for an active bias
+        if bias == 1
+            if close < biasInv
+                bias := 0
+                note := "Bull bias invalidated"
+            else if not na(tgt) and high >= tgt
+                bias := 0
+                note := "Bull DOL reached"
+                if showLbl
+                    label.new(bar_index, high, nm + " DOL reached", style=label.style_label_down, color=color.new(bullCol, 30), textcolor=color.white, size=size.small)
+        else if bias == -1
+            if close > biasInv
+                bias := 0
+                note := "Bear bias invalidated"
+            else if not na(tgt) and low <= tgt
+                bias := 0
+                note := "Bear DOL reached"
+                if showLbl
+                    label.new(bar_index, low, nm + " DOL reached", style=label.style_label_up, color=color.new(bearCol, 30), textcolor=color.white, size=size.small)
+
+        // 3) ERL sweeps -> arm
+        if useERL and not na(swL) and low < swL and swLT != sweptLowT
+            sweptLowT := swLT
+            armDir := 1
+            armModel := "ERL>IRL"
+            armTime := time
+            armExt := low
+            armInv := na
+            line.new(swLT, swL, time, swL, xloc=xloc.bar_time, color=bullCol, style=line.style_dotted)
+            if showLbl
+                label.new(bar_index, low, nm + " SSL swept", style=label.style_label_up, color=color.new(bullCol, 20), textcolor=color.white, size=size.small)
+            if alertsOn
+                alert(nm + " SSL swept on " + syminfo.ticker + " - waiting " + f_tfName(confTF) + " MSS/CISD", alert.freq_once_per_bar)
+        if useERL and not na(swH) and high > swH and swHT != sweptHighT
+            sweptHighT := swHT
+            armDir := -1
+            armModel := "ERL>IRL"
+            armTime := time
+            armExt := high
+            armInv := na
+            line.new(swHT, swH, time, swH, xloc=xloc.bar_time, color=bearCol, style=line.style_dotted)
+            if showLbl
+                label.new(bar_index, high, nm + " BSL swept", style=label.style_label_down, color=color.new(bearCol, 20), textcolor=color.white, size=size.small)
+            if alertsOn
+                alert(nm + " BSL swept on " + syminfo.ticker + " - waiting " + f_tfName(confTF) + " MSS/CISD", alert.freq_once_per_bar)
+
+        // 3b) IRL taps -> arm
+        if useIRL and not na(bBot) and bT != tapBullT and time >= bDone and low <= bTop and close >= bBot
+            tapBullT := bT
+            armDir := 1
+            armModel := "IRL>ERL"
+            armTime := time
+            armExt := low
+            armInv := bBot
+            if showLbl
+                label.new(bar_index, low, nm + " bull FVG tap", style=label.style_label_up, color=color.new(bullCol, 20), textcolor=color.white, size=size.small)
+            if alertsOn
+                alert(nm + " bull FVG tapped on " + syminfo.ticker + " - waiting " + f_tfName(confTF) + " MSS/CISD", alert.freq_once_per_bar)
+        if useIRL and not na(sTop) and sT != tapBearT and time >= sDone and high >= sBot and close <= sTop
+            tapBearT := sT
+            armDir := -1
+            armModel := "IRL>ERL"
+            armTime := time
+            armExt := high
+            armInv := sTop
+            if showLbl
+                label.new(bar_index, high, nm + " bear FVG tap", style=label.style_label_down, color=color.new(bearCol, 20), textcolor=color.white, size=size.small)
+            if alertsOn
+                alert(nm + " bear FVG tapped on " + syminfo.ticker + " - waiting " + f_tfName(confTF) + " MSS/CISD", alert.freq_once_per_bar)
+
+        // track extreme while armed (used as invalidation after confirmation for ERL setups)
+        if armDir == 1
+            armExt := math.min(nz(armExt, low), low)
+        if armDir == -1
+            armExt := math.max(nz(armExt, high), high)
+
+        // 4) confirmation on the lower TF
+        if armDir == 1 and (bullMSS or bullCISD) and armTime < time
+            bias := 1
+            biasModel := armModel
+            biasInv := armModel == "IRL>ERL" ? armInv : armExt
+            armDir := 0
+            note := ""
+            string how = bullMSS and bullCISD ? "MSS+CISD" : bullMSS ? "MSS" : "CISD"
+            if showLbl
+                label.new(bar_index, low, nm + " BULL BIAS (" + armModel + ") " + how, style=label.style_label_up, color=bullCol, textcolor=color.white, size=size.normal)
+            if alertsOn
+                alert(nm + " BULLISH bias confirmed (" + armModel + ", " + f_tfName(confTF) + " " + how + ") on " + syminfo.ticker, alert.freq_once_per_bar)
+        else if armDir == -1 and (bearMSS or bearCISD) and armTime < time
+            bias := -1
+            biasModel := armModel
+            biasInv := armModel == "IRL>ERL" ? armInv : armExt
+            armDir := 0
+            note := ""
+            string how = bearMSS and bearCISD ? "MSS+CISD" : bearMSS ? "MSS" : "CISD"
+            if showLbl
+                label.new(bar_index, high, nm + " BEAR BIAS (" + armModel + ") " + how, style=label.style_label_down, color=bearCol, textcolor=color.white, size=size.normal)
+            if alertsOn
+                alert(nm + " BEARISH bias confirmed (" + armModel + ", " + f_tfName(confTF) + " " + how + ") on " + syminfo.ticker, alert.freq_once_per_bar)
+
+        // 5) Draw on liquidity
+        float dTop = na
+        float dBot = na
+        int dT = na
+        string dTxt = ""
+        if bias == 1
+            bool fvgOk = not na(sBot) and sBot > close
+            bool extOk = not na(swH) and swH > close
+            if biasModel == "IRL>ERL" and extOk
+                dLvl := swH
+                dTxt := "BSL (swing high)"
+            else if fvgOk
+                dLvl := sBot
+                dTop := sTop
+                dBot := sBot
+                dT := sT
+                dTxt := "FVG upside"
+            else if extOk
+                dLvl := swH
+                dTxt := "BSL (swing high)"
+        else if bias == -1
+            bool fvgOk = not na(bTop) and bTop < close
+            bool extOk = not na(swL) and swL < close
+            if biasModel == "IRL>ERL" and extOk
+                dLvl := swL
+                dTxt := "SSL (swing low)"
+            else if fvgOk
+                dLvl := bTop
+                dTop := bTop
+                dBot := bBot
+                dT := bT
+                dTxt := "FVG downside"
+            else if extOk
+                dLvl := swL
+                dTxt := "SSL (swing low)"
+        tgt := dLvl
+
+        if showDol and bias != 0 and not na(dLvl)
+            if dLvl != lastLvl or nz(dTop) != nz(lastTop) or na(dolLine)
+                line.delete(dolLine)
+                box.delete(dolBox)
+                label.delete(dolLbl)
+                color c = bias == 1 ? bullCol : bearCol
+                dolLine := line.new(time, dLvl, time + 1, dLvl, xloc=xloc.bar_time, extend=extend.right, color=c, style=line.style_dashed)
+                if not na(dTop)
+                    dolBox := box.new(dT, dTop, time, dBot, xloc=xloc.bar_time, extend=extend.right, bgcolor=color.new(c, 85), border_color=color.new(c, 40))
+                dolLbl := label.new(time, dLvl, nm + " DOL: " + dTxt, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(c, 20), textcolor=color.white, size=size.small)
+                lastLvl := dLvl
+                lastTop := dTop
+        else
+            line.delete(dolLine)
+            box.delete(dolBox)
+            label.delete(dolLbl)
+            dolLine := na
+            dolBox := na
+            dolLbl := na
+            lastLvl := na
+            lastTop := na
+
+    string st = "Off"
+    if en
+        if not tfOk
+            st := "Chart TF > " + f_tfName(confTF)
+        else if bias == 1
+            st := "BULL (" + biasModel + ")"
+        else if bias == -1
+            st := "BEAR (" + biasModel + ")"
+        else if armDir == 1
+            st := "Armed bull - wait MSS/CISD"
+        else if armDir == -1
+            st := "Armed bear - wait MSS/CISD"
+        else
+            st := note != "" ? note : "Waiting for sweep / tap"
+    [bias, st, dLvl]
+
+// ------------------------------------ RUN --------------------------------------------
+[mnB, mnS, mnD] = f_module("M", cfMN, "MN", showMN)
+[wB, wS, wD]    = f_module("W", cfW, "W", showW)
+[dB, dS, dD]    = f_module("D", cfD, "D1", showD)
+[h4B, h4S, h4D] = f_module("240", cfH4, "H4", showH4)
+
+// --------------------------------- DASHBOARD -----------------------------------------
+tpos = tblPos == "Top Right" ? position.top_right : tblPos == "Top Left" ? position.top_left : tblPos == "Bottom Right" ? position.bottom_right : position.bottom_left
+var table tbl = table.new(tpos, 5, 5, frame_color=color.gray, frame_width=1, border_color=color.gray, border_width=1)
+
+f_row(int r, string name, string conf, string entry, int b, string stt, float dol) =>
+    color bg = b == 1 ? color.new(bullCol, 25) : b == -1 ? color.new(bearCol, 25) : color.new(color.gray, 70)
+    table.cell(tbl, 0, r, name, text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=size.small)
+    table.cell(tbl, 1, r, conf, text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=size.small)
+    table.cell(tbl, 2, r, entry, text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=size.small)
+    table.cell(tbl, 3, r, stt, text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(tbl, 4, r, na(dol) ? "-" : str.tostring(dol, format.mintick), text_color=color.white, bgcolor=bg, text_size=size.small)
+
+if barstate.islast and showTbl
+    table.cell(tbl, 0, 0, "Bias TF", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
+    table.cell(tbl, 1, 0, "Confirm", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
+    table.cell(tbl, 2, 0, "Entry TF", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
+    table.cell(tbl, 3, 0, "Status", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
+    table.cell(tbl, 4, 0, "DOL", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
+    f_row(1, "Monthly", f_tfName(cfMN), "H1 / M5", mnB, mnS, mnD)
+    f_row(2, "Weekly", f_tfName(cfW), "M15 / M1", wB, wS, wD)
+    f_row(3, "Daily", f_tfName(cfD), "M5", dB, dS, dD)
+    f_row(4, "H4", f_tfName(cfH4), "M1", h4B, h4S, h4D)
