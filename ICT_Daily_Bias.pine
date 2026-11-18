@@ -2,66 +2,80 @@
 indicator("ICT Daily Bias | ERL-IRL + MTF MSS", shorttitle="ICT Bias", overlay=true, max_labels_count=200, max_lines_count=100)
 
 // =====================================================================
-//  ICT DAILY BIAS  (v2 - works from any chart timeframe)
-//  Liquidity timeframe (default Daily) -> ERL / IRL map
-//  Mid timeframe (auto-aligned, default H1) -> MSS confirmation
+//  ICT DAILY BIAS  (v3)
 //
-//  Alignment (default):  Weekly -> H4 | Daily -> H1 | H4 -> 15m | H1 -> 5m
+//  ERL (external range liquidity) = confirmed SWING HIGHS / SWING LOWS on
+//      the Daily, Weekly and Monthly timeframes (each can be switched off).
+//  IRL (internal range liquidity) = unfilled FVGs and the 50% equilibrium
+//      of the same timeframe's dealing range.
 //
-//  ERL > IRL : external liquidity swept (prev high/low, swing, prev week)
-//              -> expect a move into an internal array (FVG / equilibrium)
-//  IRL > ERL : internal array (Daily FVG) tapped and rejected
-//              -> expect a move to the next external liquidity (swing first)
-//  Bias is only CONFIRMED when the aligned MTF prints a closed-candle MSS
-//  with displacement in the expected direction.
+//  One engine runs per liquidity timeframe, each confirmed on its own
+//  aligned mid timeframe (default):
+//      Daily swing   -> H1 MSS
+//      Weekly swing  -> H4 MSS
+//      Monthly swing -> Daily MSS
 //
-//  If the chart timeframe is ABOVE the MTF (e.g. Daily chart, H1 MTF) the
-//  script reads the MTF intrabars directly, so you can keep the Daily chart.
-//  Only CLOSED MTF bars are used (no repainting).
+//  ERL > IRL : a swing high/low is swept   -> expect a move into an IRL
+//  IRL > ERL : an unfilled FVG is tapped   -> expect a move to the swing
+//  Bias is CONFIRMED only by a closed-candle MSS (with displacement) on the
+//  aligned mid timeframe. Works from any chart timeframe up to Daily (the
+//  mid-timeframe bars are read as intrabars when the chart is higher).
+//  Only closed bars are used, so nothing repaints.
+//
+//  Overall bias: the most recent live event wins; on a tie the higher timeframe wins.
 // =====================================================================
 
 // ───────────────────────── Inputs ─────────────────────────
-liqTf       = input.string("D", "Liquidity timeframe (where the sweep is read)", options=["W", "D", "240", "60"], group="Timeframe alignment", tooltip="Auto MTF: W>H4, D>H1, H4>15m, H1>5m")
-mtfOverride = input.timeframe("", "MTF override (blank = auto)", group="Timeframe alignment")
+useD  = input.bool(true, "Daily swing highs/lows as ERL",   group="ERL timeframes")
+useW  = input.bool(true, "Weekly swing highs/lows as ERL",  group="ERL timeframes")
+useM  = input.bool(true, "Monthly swing highs/lows as ERL", group="ERL timeframes")
+swD   = input.int(3, "Swing length - Daily",   minval=1, group="ERL timeframes")
+swW   = input.int(2, "Swing length - Weekly",  minval=1, group="ERL timeframes")
+swM   = input.int(2, "Swing length - Monthly", minval=1, group="ERL timeframes")
 
-liqPiv      = input.int(3, "Swing length - liquidity TF", minval=1, group="Structure")
-mtfPiv      = input.int(2, "Swing length - MTF", minval=1, group="Structure")
-atrLen      = input.int(14, "ATR length (MTF)", minval=1, group="Structure")
-dispMult    = input.float(1.0, "MSS displacement: candle body >= ATR x", minval=0.0, step=0.1, group="Structure")
+dMtf  = input.timeframe("60",  "MSS timeframe for Daily swings",   group="Timeframe alignment")
+wMtf  = input.timeframe("240", "MSS timeframe for Weekly swings",  group="Timeframe alignment")
+mMtf  = input.timeframe("D",   "MSS timeframe for Monthly swings", group="Timeframe alignment")
 
-inclWeekly  = input.bool(true, "Include previous-week high/low as ERL", group="Liquidity")
-pdFilter    = input.bool(false, "Premium/discount filter on IRL taps", group="Liquidity")
-maxAge      = input.int(5, "Pending bias expires after (liquidity bars)", minval=1, group="Liquidity")
+mtfPiv   = input.int(2, "Swing length - MSS timeframe", minval=1, group="MSS")
+atrLen   = input.int(14, "ATR length (MSS timeframe)", minval=1, group="MSS")
+dispMult = input.float(0.0, "MSS displacement: candle body >= ATR x (0 = off)", minval=0.0, step=0.1, group="MSS")
 
-showLevels  = input.bool(true, "Plot levels", group="Display")
-showTable   = input.bool(true, "Show bias table", group="Display")
-showLabels  = input.bool(true, "Show event labels", group="Display")
-showBg      = input.bool(true, "Tint background when confirmed", group="Display")
-colBull     = input.color(#26a69a, "Bullish colour", group="Display")
-colBear     = input.color(#ef5350, "Bearish colour", group="Display")
+pdFilter = input.bool(false, "Premium/discount filter on IRL taps", group="Bias")
+maxAge   = input.int(40, "Pending bias expires after (MSS-timeframe bars)", minval=1, group="Bias")
 
-// ───────────────────────── Derived settings ─────────────────────────
-autoMtf = switch liqTf
-    "W"   => "240"
-    "D"   => "60"
-    "240" => "15"
-    =>       "5"
+showLevels = input.bool(true, "Plot swing levels", group="Display")
+showTable  = input.bool(true, "Show bias table", group="Display")
+showLabels = input.bool(true, "Show event labels", group="Display")
+showBg     = input.bool(true, "Tint background when confirmed", group="Display")
+colBull    = input.color(#26a69a, "Bullish colour", group="Display")
+colBear    = input.color(#ef5350, "Bearish colour", group="Display")
 
-liqName = switch liqTf
-    "W"   => "Weekly"
-    "D"   => "Daily"
-    "240" => "H4"
-    =>       "H1"
-
-mtfTf     = mtfOverride == "" ? autoMtf : mtfOverride
-useWeekly = inclWeekly and liqTf != "W"
-mtfSec    = timeframe.in_seconds(mtfTf)
-lowerMode = timeframe.in_seconds() > mtfSec                      // chart above MTF -> read intrabars
-warnTf    = timeframe.in_seconds() > timeframe.in_seconds(liqTf) // chart above liquidity TF -> not supported
+// ───────────────────────── Types ─────────────────────────
+type Eng
+    int    dir      = 0      // +1 bullish, -1 bearish
+    int    status   = 0      // 0 none, 1 pending MSS, 2 confirmed, 3 invalidated, 4 target reached
+    int    kind     = 0      // 1 = ERL>IRL, 2 = IRL>ERL
+    float  inval    = na
+    float  tgt      = na
+    string tgtName  = "-"
+    string evtTxt   = "Waiting for ERL sweep / IRL tap"
+    int    evtTime  = na
+    float  mssLvl   = na
+    float  cSH      = na     // swing high already swept
+    float  cSL      = na     // swing low already swept
+    float  cBZ      = na     // bull FVG already tapped
+    float  cSZ      = na     // bear FVG already tapped
+    string tfName   = ""
+    string mtfTxt   = ""
+    bool   fEvent   = false
+    bool   fBull    = false
+    bool   fBear    = false
+    bool   fInval   = false
 
 // ───────────────────────── Data functions ─────────────────────────
-// Liquidity timeframe: previous completed bar high/low, last confirmed swings,
-// latest unmitigated bullish / bearish FVG. Returned [1] = completed bar values.
+// ERL timeframe: last confirmed swing high/low, latest unmitigated bull / bear FVG.
+// Returned [1] = completed-bar values (final when read with lookahead_on).
 f_liq(int n) =>
     ph = ta.pivothigh(high, n, n)
     pl = ta.pivotlow(low, n, n)
@@ -87,10 +101,10 @@ f_liq(int n) =>
     if not na(sTop) and close > sTop
         sTop := na
         sBot := na
-    [high[1], low[1], sh[1], sl[1], bTop[1], bBot[1], sTop[1], sBot[1]]
+    [sh[1], sl[1], bTop[1], bBot[1], sTop[1], sBot[1]]
 
-// MTF values for the CURRENT bar (used with request.security_lower_tf)
-f_mtfNow(int n, int len) =>
+// MSS timeframe, CURRENT bar (for request.security_lower_tf)
+f_mtfNow(int n, int len, float mult) =>
     ph = ta.pivothigh(high, n, n)
     pl = ta.pivotlow(low, n, n)
     var float sh = na
@@ -100,10 +114,11 @@ f_mtfNow(int n, int len) =>
     if not na(pl)
         sl := pl
     a = ta.atr(len)
-    [time, open, high, low, close, sh, sl, a]
+    float disp = (mult <= 0.0 or math.abs(close - open) >= mult * a) ? 1.0 : 0.0
+    [time, high, low, close, sh, sl, disp]
 
-// MTF values for the last CLOSED bar (used when chart TF <= MTF)
-f_mtf(int n, int len) =>
+// MSS timeframe, last CLOSED bar (when the chart timeframe <= MSS timeframe)
+f_mtf(int n, int len, float mult) =>
     ph = ta.pivothigh(high, n, n)
     pl = ta.pivotlow(low, n, n)
     var float sh = na
@@ -113,13 +128,13 @@ f_mtf(int n, int len) =>
     if not na(pl)
         sl := pl
     a = ta.atr(len)
-    [time[1], open[1], high[1], low[1], close[1], sh[1], sl[1], a[1]]
+    float disp = (mult <= 0.0 or math.abs(close - open) >= mult * a) ? 1.0 : 0.0
+    [time[1], high[1], low[1], close[1], sh[1], sl[1], disp[1]]
 
 // Target / draw on liquidity.
 // kind 1 (ERL>IRL): nearest internal array in the bias direction (FVG or equilibrium)
-// kind 2 (IRL>ERL): external liquidity in the bias direction - swing high/low first,
-//                   otherwise the nearest of previous high/low and previous week
-f_target(int d, int k, float px, float eq, float bullZoneTop, float bearZoneBot, float sh, float sl, float pdh, float pdl, float pwh, float pwl) =>
+// kind 2 (IRL>ERL): the swing high/low of the same timeframe
+f_target(int d, int k, float px, float eq, float bullZoneTop, float bearZoneBot, float sh, float sl) =>
     float t = na
     string n = "-"
     if d == -1 and k == 1
@@ -131,7 +146,7 @@ f_target(int d, int k, float px, float eq, float bullZoneTop, float bearZoneBot,
             n := "Equilibrium"
         if na(t) and not na(sl) and sl < px
             t := sl
-            n := "Range low"
+            n := "Swing low"
     else if d == 1 and k == 1
         if not na(bearZoneBot) and bearZoneBot > px
             t := bearZoneBot
@@ -141,302 +156,391 @@ f_target(int d, int k, float px, float eq, float bullZoneTop, float bearZoneBot,
             n := "Equilibrium"
         if na(t) and not na(sh) and sh > px
             t := sh
-            n := "Range high"
+            n := "Swing high"
     else if d == 1 and k == 2
         if not na(sh) and sh > px
             t := sh
             n := "Swing high"
-        if na(t) and not na(pdh) and pdh > px
-            t := pdh
-            n := "Prev high"
-        if not na(pwh) and pwh > px and (na(t) or pwh < t)
-            t := pwh
-            n := "Prev week high"
     else if d == -1 and k == 2
         if not na(sl) and sl < px
             t := sl
             n := "Swing low"
-        if na(t) and not na(pdl) and pdl < px
-            t := pdl
-            n := "Prev low"
-        if not na(pwl) and pwl < px and (na(t) or pwl > t)
-            t := pwl
-            n := "Prev week low"
     [t, n]
 
 f_fresh(float lvl, float consumed) =>
     not na(lvl) and (na(consumed) or lvl != consumed)
 
-// ───────────────────────── Data requests ─────────────────────────
-[pdh, pdl, lSH, lSL, bzT, bzB, szT, szB] = request.security(syminfo.tickerid, liqTf, f_liq(liqPiv), lookahead = barmerge.lookahead_on)
-[wkH, wkL] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
-[mT, mO, mH, mL, mC, mSH, mSL, mATR] = request.security(syminfo.tickerid, mtfTf, f_mtf(mtfPiv, atrLen), lookahead = barmerge.lookahead_on)
+f_rank(Eng e) =>
+    e.status == 2 ? 2 : (e.status == 1 ? 1 : 0)
 
-float pwh = useWeekly ? wkH : na
-float pwl = useWeekly ? wkL : na
-float eq  = (not na(lSH) and not na(lSL)) ? (lSH + lSL) / 2 : na
+f_tfTxt(string tf) =>
+    switch tf
+        "60"  => "H1"
+        "240" => "H4"
+        "D"   => "D"
+        "W"   => "W"
+        "M"   => "M"
+        =>       tf + "m"
 
-// MTF bars to process on this chart bar (arrays, oldest first)
-array<int>   aT  = array.new<int>()
-array<float> aO  = array.new<float>()
-array<float> aH  = array.new<float>()
-array<float> aL  = array.new<float>()
-array<float> aC  = array.new<float>()
-array<float> aSH = array.new<float>()
-array<float> aSL = array.new<float>()
-array<float> aAT = array.new<float>()
-
-bool newMtf = not na(mT) and mT != nz(mT[1])
-
-if lowerMode
-    [t1, o1, h1, l1, c1, sh1, sl1, at1] = request.security_lower_tf(syminfo.tickerid, mtfTf, f_mtfNow(mtfPiv, atrLen))
-    if not na(t1)
-        aT  := t1
-        aO  := o1
-        aH  := h1
-        aL  := l1
-        aC  := c1
-        aSH := sh1
-        aSL := sl1
-        aAT := at1
-else if newMtf
-    aT  := array.from(mT)
-    aO  := array.from(mO)
-    aH  := array.from(mH)
-    aL  := array.from(mL)
-    aC  := array.from(mC)
-    aSH := array.from(mSH)
-    aSL := array.from(mSL)
-    aAT := array.from(mATR)
-
-// ───────────────────────── State ─────────────────────────
-var int    dir     = 0      // +1 bullish, -1 bearish
-var int    status  = 0      // 0 none, 1 pending MSS, 2 confirmed, 3 invalidated, 4 target reached
-var int    kind    = 0      // 1 = ERL>IRL, 2 = IRL>ERL
-var float  inval   = na
-var float  tgt     = na
-var string tgtName = "-"
-var string evtTxt  = "Waiting for ERL sweep / IRL tap"
-var int    evtTime = na
-var float  mssLvl  = na
-
-// levels already swept / zones already tapped (prevents re-triggering)
-var float cPDH = na
-var float cSH  = na
-var float cPWH = na
-var float cPDL = na
-var float cSL  = na
-var float cPWL = na
-var float cBZ  = na
-var float cSZ  = na
-
-bool fEvent    = false
-bool fConfBull = false
-bool fConfBear = false
-bool fInval    = false
-
-// ───────────────────────── Engine (runs once per CLOSED MTF bar) ─────────────────────────
-int cnt = na(aT) ? 0 : array.size(aT)
-
-if cnt > 0
-    for i = 0 to cnt - 1
-        int   bT  = array.get(aT, i)
-        float bO  = array.get(aO, i)
-        float bH  = array.get(aH, i)
-        float bL  = array.get(aL, i)
-        float bC  = array.get(aC, i)
-        float bSH = array.get(aSH, i)
-        float bSL = array.get(aSL, i)
-        float bAT = array.get(aAT, i)
-
-        // skip the still-forming MTF bar
-        if lowerMode and bT + mtfSec * 1000 > timenow
-            continue
-        if na(bH) or na(bL) or na(bC)
-            continue
-
-        // 1) fresh external liquidity taken on this MTF bar?
-        bool sH = false
-        bool sL = false
-        string hiN = ""
-        string loN = ""
-
-        if f_fresh(pdh, cPDH) and bH > pdh
-            sH := true
-            hiN := "Prev " + liqName + " high"
-        if f_fresh(lSH, cSH) and bH > lSH
-            sH := true
-            hiN := hiN == "" ? liqName + " swing high" : hiN
-        if f_fresh(pwh, cPWH) and bH > pwh
-            sH := true
-            hiN := hiN == "" ? "Prev week high" : hiN
-
-        if f_fresh(pdl, cPDL) and bL < pdl
-            sL := true
-            loN := "Prev " + liqName + " low"
-        if f_fresh(lSL, cSL) and bL < lSL
-            sL := true
-            loN := loN == "" ? liqName + " swing low" : loN
-        if f_fresh(pwl, cPWL) and bL < pwl
-            sL := true
-            loN := loN == "" ? "Prev week low" : loN
-
-        // 2) fresh tap of an internal array (unmitigated liquidity-TF FVG)?
-        bool canBear = not (dir == -1 and status == 2)
-        bool canBull = not (dir == 1 and status == 2)
-        bool bearEvt = sH and not sL and canBear
-        bool bullEvt = sL and not sH and canBull
-        bool bullTap = false
-        bool bearTap = false
-        if not (sH or sL)
-            bullTap := f_fresh(bzB, cBZ) and bL <= bzT and bC > bzB and canBull and (not pdFilter or (not na(eq) and (bzT + bzB) / 2 < eq))
-            bearTap := f_fresh(szB, cSZ) and bH >= szB and bC < szT and canBear and (not pdFilter or (not na(eq) and (szT + szB) / 2 > eq))
-            if bullTap and bearTap
-                bearTap := false
-
-        // 3) consume swept levels / tapped zones
-        if not na(pdh) and bH > pdh
-            cPDH := pdh
-        if not na(lSH) and bH > lSH
-            cSH := lSH
-        if not na(pwh) and bH > pwh
-            cPWH := pwh
-        if not na(pdl) and bL < pdl
-            cPDL := pdl
-        if not na(lSL) and bL < lSL
-            cSL := lSL
-        if not na(pwl) and bL < pwl
-            cPWL := pwl
-        if not na(bzT) and bL <= bzT
-            cBZ := bzB
-        if not na(szB) and bH >= szB
-            cSZ := szB
-
-        // 4) set a new event
-        bool newlySet = false
-        if bearEvt
-            dir := -1
-            kind := 1
-            status := 1
-            inval := bH
-            evtTime := bT
-            evtTxt := "ERL swept: " + hiN
-            newlySet := true
-        else if bullEvt
-            dir := 1
-            kind := 1
-            status := 1
-            inval := bL
-            evtTime := bT
-            evtTxt := "ERL swept: " + loN
-            newlySet := true
-        else if bullTap
-            dir := 1
-            kind := 2
-            status := 1
-            inval := bL
-            evtTime := bT
-            evtTxt := "IRL tapped: " + liqName + " bull FVG"
-            newlySet := true
-        else if bearTap
-            dir := -1
-            kind := 2
-            status := 1
-            inval := bH
-            evtTime := bT
-            evtTxt := "IRL tapped: " + liqName + " bear FVG"
-            newlySet := true
-
-        [tT, tN] = f_target(dir, kind, bC, eq, bzT, szB, lSH, lSL, pdh, pdl, pwh, pwl)
-
-        if newlySet
-            tgt := tT
-            tgtName := tN
-            fEvent := true
-            if showLabels
-                label.new(bar_index, dir == 1 ? low : high, (kind == 1 ? "ERL>IRL" : "IRL>ERL") + (dir == 1 ? " bull" : " bear"), style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(dir == 1 ? colBull : colBear, 20), textcolor = color.white, size = size.small)
-
-        // 5) pending -> confirmed / invalidated / expired ; confirmed -> invalidated / target
-        if status == 1
-            bool failed  = not newlySet and ((dir == -1 and bC > inval) or (dir == 1 and bC < inval))
-            bool expired = not newlySet and not na(evtTime) and (bT - evtTime) > maxAge * timeframe.in_seconds(liqTf) * 1000
-            if failed
-                status := 3
-                fInval := true
-            else if expired
-                status := 0
-                dir := 0
-                evtTxt := "Expired - waiting for ERL sweep / IRL tap"
-            else
-                if dir == -1
-                    inval := math.max(inval, bH)
-                else
-                    inval := math.min(inval, bL)
-                bool disp = math.abs(bC - bO) >= dispMult * bAT
-                bool mss  = dir == -1 ? (not na(bSL) and bC < bSL and disp) : (not na(bSH) and bC > bSH and disp)
-                if mss
-                    status := 2
-                    mssLvl := dir == -1 ? bSL : bSH
-                    tgt := tT
-                    tgtName := tN
-                    if dir == 1
-                        fConfBull := true
-                    else
-                        fConfBear := true
-                    if showLabels
-                        label.new(bar_index, dir == 1 ? low : high, "MSS " + mtfTf + (dir == 1 ? " ▲" : " ▼"), style = dir == 1 ? label.style_label_up : label.style_label_down, color = dir == 1 ? colBull : colBear, textcolor = color.white, size = size.small)
-                        if not na(evtTime)
-                            line.new(evtTime, mssLvl, bT, mssLvl, xloc = xloc.bar_time, color = dir == 1 ? colBull : colBear, width = 1, style = line.style_dashed)
-        else if status == 2
-            if (dir == -1 and bC > inval) or (dir == 1 and bC < inval)
-                status := 3
-                fInval := true
-            else if not na(tgt) and ((dir == -1 and bL <= tgt) or (dir == 1 and bH >= tgt))
-                status := 4
-
-// ───────────────────────── Plots ─────────────────────────
-plot(showLevels ? pdh : na, "Prev high (liquidity TF)", color = color.new(colBear, 30), style = plot.style_linebr, linewidth = 1)
-plot(showLevels ? pdl : na, "Prev low (liquidity TF)", color = color.new(colBull, 30), style = plot.style_linebr, linewidth = 1)
-plot(showLevels ? pwh : na, "Prev week high", color = color.new(colBear, 60), style = plot.style_linebr, linewidth = 1)
-plot(showLevels ? pwl : na, "Prev week low", color = color.new(colBull, 60), style = plot.style_linebr, linewidth = 1)
-plot(showLevels ? eq : na, "Equilibrium (50%)", color = color.new(color.gray, 20), style = plot.style_linebr, linewidth = 1)
-
-bgcolor(showBg and status == 2 ? color.new(dir == 1 ? colBull : colBear, 93) : na)
-
-// ───────────────────────── Table ─────────────────────────
-var table tb = table.new(position.top_right, 2, 7, border_width = 1, frame_color = color.gray, border_color = color.gray)
-
-if barstate.islast and showTable
-    bool live = status == 1 or status == 2
-    color bc = live ? (dir == 1 ? colBull : colBear) : color.gray
-    string biasTxt = live ? (dir == 1 ? "BULLISH" : "BEARISH") : "NEUTRAL"
-    string stTxt = switch status
+f_stTxt(Eng e) =>
+    switch e.status
         0 => "Waiting for sweep / IRL tap"
-        1 => "Pending - need " + mtfTf + " MSS"
-        2 => "Confirmed by " + mtfTf + " MSS"
+        1 => "Pending - need " + e.mtfTxt + " MSS"
+        2 => "Confirmed by " + e.mtfTxt + " MSS"
         3 => "Invalidated"
         =>   "Target reached"
-    string tgtTxt = (live or status == 4) and not na(tgt) ? tgtName + " @ " + str.tostring(tgt, format.mintick) : "-"
-    string invTxt = live and not na(inval) ? str.tostring(inval, format.mintick) : "-"
-    string chkTxt = warnTf ? "Chart TF is above the liquidity TF - lower it" : (lowerMode ? "OK - reading " + mtfTf + " intrabars" : "OK")
 
-    table.cell(tb, 0, 0, "Bias (" + liqName + ")", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
+f_shortTxt(Eng e, bool on) =>
+    string r = "Off"
+    if on
+        if e.status == 1 or e.status == 2
+            r := (e.dir == 1 ? "BULLISH" : "BEARISH") + (e.status == 2 ? " - confirmed" : " - pending")
+        else if e.status == 3
+            r := "Invalidated"
+        else if e.status == 4
+            r := "Target reached"
+        else
+            r := "Neutral"
+    r
+
+// ───────────────────────── Engine (one run per CLOSED MSS-timeframe bar) ─────────────────────────
+method run(Eng e, string nm, string mtfTxt, bool lower, int mtfSecs, int liqSecs, float sh, float sl, float eq, float bzT, float bzB, float szT, float szB, array<int> aT, array<float> aH, array<float> aL, array<float> aC, array<float> aSH, array<float> aSL, array<float> aD) =>
+    e.tfName := nm
+    e.mtfTxt := mtfTxt
+    string sn = str.substring(nm, 0, 1)
+    int cnt = na(aT) ? 0 : array.size(aT)
+    if cnt > 0
+        for i = 0 to cnt - 1
+            int   bT   = array.get(aT, i)
+            float bH   = array.get(aH, i)
+            float bL   = array.get(aL, i)
+            float bC   = array.get(aC, i)
+            float bSH  = array.get(aSH, i)
+            float bSL  = array.get(aSL, i)
+            bool  bDsp = array.get(aD, i) > 0.5
+
+            // skip the still-forming bar (only relevant when reading intrabars)
+            if lower and bT + mtfSecs * 1000 > timenow
+                continue
+            if na(bH) or na(bL) or na(bC)
+                continue
+
+            // 1) swing high / low (ERL) swept on this bar?
+            bool sH = f_fresh(sh, e.cSH) and bH > sh
+            bool sL = f_fresh(sl, e.cSL) and bL < sl
+
+            // 2) unfilled FVG (IRL) tapped on this bar?
+            bool canBear = not (e.dir == -1 and e.status == 2)
+            bool canBull = not (e.dir == 1 and e.status == 2)
+            bool bearEvt = sH and not sL and canBear
+            bool bullEvt = sL and not sH and canBull
+            bool bullTap = false
+            bool bearTap = false
+            if not (sH or sL)
+                bullTap := f_fresh(bzB, e.cBZ) and bL <= bzT and bC > bzB and canBull and (not pdFilter or (not na(eq) and (bzT + bzB) / 2 < eq))
+                bearTap := f_fresh(szB, e.cSZ) and bH >= szB and bC < szT and canBear and (not pdFilter or (not na(eq) and (szT + szB) / 2 > eq))
+                if bullTap and bearTap
+                    bearTap := false
+
+            // 3) consume swept swings / tapped zones
+            if not na(sh) and bH > sh
+                e.cSH := sh
+            if not na(sl) and bL < sl
+                e.cSL := sl
+            if not na(bzT) and bL <= bzT
+                e.cBZ := bzB
+            if not na(szB) and bH >= szB
+                e.cSZ := szB
+
+            // 4) set a new event
+            bool newlySet = false
+            if bearEvt
+                e.dir := -1
+                e.kind := 1
+                e.status := 1
+                e.inval := bH
+                e.evtTime := bT
+                e.evtTxt := "ERL swept: " + nm + " swing high"
+                newlySet := true
+            else if bullEvt
+                e.dir := 1
+                e.kind := 1
+                e.status := 1
+                e.inval := bL
+                e.evtTime := bT
+                e.evtTxt := "ERL swept: " + nm + " swing low"
+                newlySet := true
+            else if bullTap
+                e.dir := 1
+                e.kind := 2
+                e.status := 1
+                e.inval := bL
+                e.evtTime := bT
+                e.evtTxt := "IRL tapped: " + nm + " bull FVG"
+                newlySet := true
+            else if bearTap
+                e.dir := -1
+                e.kind := 2
+                e.status := 1
+                e.inval := bH
+                e.evtTime := bT
+                e.evtTxt := "IRL tapped: " + nm + " bear FVG"
+                newlySet := true
+
+            [tT, tN] = f_target(e.dir, e.kind, bC, eq, bzT, szB, sh, sl)
+
+            if newlySet
+                e.tgt := tT
+                e.tgtName := tN
+                e.fEvent := true
+                if showLabels
+                    label.new(bar_index, e.dir == 1 ? low : high, sn + (e.kind == 1 ? " ERL>IRL" : " IRL>ERL") + (e.dir == 1 ? " bull" : " bear"), style = e.dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(e.dir == 1 ? colBull : colBear, 20), textcolor = color.white, size = size.small)
+
+            // 5) pending -> confirmed / invalidated / expired ; confirmed -> invalidated / target
+            if e.status == 1
+                bool failed  = not newlySet and ((e.dir == -1 and bC > e.inval) or (e.dir == 1 and bC < e.inval))
+                bool expired = not newlySet and not na(e.evtTime) and (bT - e.evtTime) > maxAge * mtfSecs * 1000
+                if failed
+                    e.status := 3
+                    e.fInval := true
+                else if expired
+                    e.status := 0
+                    e.dir := 0
+                    e.evtTxt := "Expired - waiting for ERL sweep / IRL tap"
+                else
+                    if e.dir == -1
+                        e.inval := math.max(e.inval, bH)
+                    else
+                        e.inval := math.min(e.inval, bL)
+                    bool mss = e.dir == -1 ? (not na(bSL) and bC < bSL and bDsp) : (not na(bSH) and bC > bSH and bDsp)
+                    if mss
+                        e.status := 2
+                        e.mssLvl := e.dir == -1 ? bSL : bSH
+                        e.tgt := tT
+                        e.tgtName := tN
+                        if e.dir == 1
+                            e.fBull := true
+                        else
+                            e.fBear := true
+                        if showLabels
+                            label.new(bar_index, e.dir == 1 ? low : high, sn + " MSS " + mtfTxt + (e.dir == 1 ? " ▲" : " ▼"), style = e.dir == 1 ? label.style_label_up : label.style_label_down, color = e.dir == 1 ? colBull : colBear, textcolor = color.white, size = size.small)
+                            if not na(e.evtTime)
+                                line.new(e.evtTime, e.mssLvl, bT, e.mssLvl, xloc = xloc.bar_time, color = e.dir == 1 ? colBull : colBear, width = 1, style = line.style_dashed)
+            else if e.status == 2
+                if (e.dir == -1 and bC > e.inval) or (e.dir == 1 and bC < e.inval)
+                    e.status := 3
+                    e.fInval := true
+                else if not na(e.tgt) and ((e.dir == -1 and bL <= e.tgt) or (e.dir == 1 and bH >= e.tgt))
+                    e.status := 4
+
+            bool stepDone = true
+
+    e.status
+
+// ───────────────────────── ERL timeframe data ─────────────────────────
+[d_sh, d_sl, d_bzT, d_bzB, d_szT, d_szB] = request.security(syminfo.tickerid, "D", f_liq(swD), lookahead = barmerge.lookahead_on)
+[w_sh, w_sl, w_bzT, w_bzB, w_szT, w_szB] = request.security(syminfo.tickerid, "W", f_liq(swW), lookahead = barmerge.lookahead_on)
+[m_sh, m_sl, m_bzT, m_bzB, m_szT, m_szB] = request.security(syminfo.tickerid, "M", f_liq(swM), lookahead = barmerge.lookahead_on)
+
+float d_eq = (not na(d_sh) and not na(d_sl)) ? (d_sh + d_sl) / 2 : na
+float w_eq = (not na(w_sh) and not na(w_sl)) ? (w_sh + w_sl) / 2 : na
+float m_eq = (not na(m_sh) and not na(m_sl)) ? (m_sh + m_sl) / 2 : na
+
+// ───────────────────────── MSS timeframe data (one stream per engine) ─────────────────────────
+int chartSec = timeframe.in_seconds()
+
+bool dLower = chartSec > timeframe.in_seconds(dMtf)
+bool wLower = chartSec > timeframe.in_seconds(wMtf)
+bool mLower = chartSec > timeframe.in_seconds(mMtf)
+
+[dn_t, dn_h, dn_l, dn_c, dn_sh, dn_sl, dn_d] = request.security(syminfo.tickerid, dMtf, f_mtf(mtfPiv, atrLen, dispMult), lookahead = barmerge.lookahead_on)
+[wn_t, wn_h, wn_l, wn_c, wn_sh, wn_sl, wn_d] = request.security(syminfo.tickerid, wMtf, f_mtf(mtfPiv, atrLen, dispMult), lookahead = barmerge.lookahead_on)
+[mn_t, mn_h, mn_l, mn_c, mn_sh, mn_sl, mn_d] = request.security(syminfo.tickerid, mMtf, f_mtf(mtfPiv, atrLen, dispMult), lookahead = barmerge.lookahead_on)
+
+bool dNew = not na(dn_t) and dn_t != nz(dn_t[1])
+bool wNew = not na(wn_t) and wn_t != nz(wn_t[1])
+bool mNew = not na(mn_t) and mn_t != nz(mn_t[1])
+
+// Daily-swing engine stream
+array<int>   dT  = array.new<int>()
+array<float> dH  = array.new<float>()
+array<float> dL  = array.new<float>()
+array<float> dC  = array.new<float>()
+array<float> dSH = array.new<float>()
+array<float> dSL = array.new<float>()
+array<float> dD  = array.new<float>()
+if dLower
+    [t1, h1, l1, c1, sh1, sl1, d1] = request.security_lower_tf(syminfo.tickerid, dMtf, f_mtfNow(mtfPiv, atrLen, dispMult))
+    if not na(t1)
+        dT  := t1
+        dH  := h1
+        dL  := l1
+        dC  := c1
+        dSH := sh1
+        dSL := sl1
+        dD  := d1
+else if dNew
+    dT  := array.from(dn_t)
+    dH  := array.from(dn_h)
+    dL  := array.from(dn_l)
+    dC  := array.from(dn_c)
+    dSH := array.from(dn_sh)
+    dSL := array.from(dn_sl)
+    dD  := array.from(dn_d)
+
+// Weekly-swing engine stream
+array<int>   wT  = array.new<int>()
+array<float> wH  = array.new<float>()
+array<float> wL  = array.new<float>()
+array<float> wC  = array.new<float>()
+array<float> wSH = array.new<float>()
+array<float> wSL = array.new<float>()
+array<float> wD  = array.new<float>()
+if wLower
+    [t2, h2, l2, c2, sh2, sl2, d2] = request.security_lower_tf(syminfo.tickerid, wMtf, f_mtfNow(mtfPiv, atrLen, dispMult))
+    if not na(t2)
+        wT  := t2
+        wH  := h2
+        wL  := l2
+        wC  := c2
+        wSH := sh2
+        wSL := sl2
+        wD  := d2
+else if wNew
+    wT  := array.from(wn_t)
+    wH  := array.from(wn_h)
+    wL  := array.from(wn_l)
+    wC  := array.from(wn_c)
+    wSH := array.from(wn_sh)
+    wSL := array.from(wn_sl)
+    wD  := array.from(wn_d)
+
+// Monthly-swing engine stream
+array<int>   mT  = array.new<int>()
+array<float> mH  = array.new<float>()
+array<float> mL  = array.new<float>()
+array<float> mC  = array.new<float>()
+array<float> mSH = array.new<float>()
+array<float> mSL = array.new<float>()
+array<float> mD  = array.new<float>()
+if mLower
+    [t3, h3, l3, c3, sh3, sl3, d3] = request.security_lower_tf(syminfo.tickerid, mMtf, f_mtfNow(mtfPiv, atrLen, dispMult))
+    if not na(t3)
+        mT  := t3
+        mH  := h3
+        mL  := l3
+        mC  := c3
+        mSH := sh3
+        mSL := sl3
+        mD  := d3
+else if mNew
+    mT  := array.from(mn_t)
+    mH  := array.from(mn_h)
+    mL  := array.from(mn_l)
+    mC  := array.from(mn_c)
+    mSH := array.from(mn_sh)
+    mSL := array.from(mn_sl)
+    mD  := array.from(mn_d)
+
+// ───────────────────────── Run the engines ─────────────────────────
+var Eng eD = Eng.new()
+var Eng eW = Eng.new()
+var Eng eM = Eng.new()
+
+eD.fEvent := false
+eD.fBull  := false
+eD.fBear  := false
+eD.fInval := false
+eW.fEvent := false
+eW.fBull  := false
+eW.fBear  := false
+eW.fInval := false
+eM.fEvent := false
+eM.fBull  := false
+eM.fBear  := false
+eM.fInval := false
+
+if useD
+    eD.run("Daily", f_tfTxt(dMtf), dLower, timeframe.in_seconds(dMtf), timeframe.in_seconds("D"), d_sh, d_sl, d_eq, d_bzT, d_bzB, d_szT, d_szB, dT, dH, dL, dC, dSH, dSL, dD)
+if useW
+    eW.run("Weekly", f_tfTxt(wMtf), wLower, timeframe.in_seconds(wMtf), timeframe.in_seconds("W"), w_sh, w_sl, w_eq, w_bzT, w_bzB, w_szT, w_szB, wT, wH, wL, wC, wSH, wSL, wD)
+if useM
+    eM.run("Monthly", f_tfTxt(mMtf), mLower, timeframe.in_seconds(mMtf), timeframe.in_seconds("M"), m_sh, m_sl, m_eq, m_bzT, m_bzB, m_szT, m_szB, mT, mH, mL, mC, mSH, mSL, mD)
+
+// Overall bias: the most recent live (pending / confirmed) liquidity event wins;
+// on an exact tie the higher timeframe wins.
+Eng best = eD
+bool found = false
+int bestTime = 0
+if useD and (eD.status == 1 or eD.status == 2)
+    best := eD
+    found := true
+    bestTime := nz(eD.evtTime)
+if useW and (eW.status == 1 or eW.status == 2) and (not found or nz(eW.evtTime) >= bestTime)
+    best := eW
+    found := true
+    bestTime := nz(eW.evtTime)
+if useM and (eM.status == 1 or eM.status == 2) and (not found or nz(eM.evtTime) >= bestTime)
+    best := eM
+    found := true
+    bestTime := nz(eM.evtTime)
+
+bool live = best.status == 1 or best.status == 2
+
+// ───────────────────────── Plots ─────────────────────────
+plot(showLevels and useD ? d_sh : na, "Daily swing high", color = color.new(colBear, 25), style = plot.style_stepline, linewidth = 1)
+plot(showLevels and useD ? d_sl : na, "Daily swing low", color = color.new(colBull, 25), style = plot.style_stepline, linewidth = 1)
+plot(showLevels and useW ? w_sh : na, "Weekly swing high", color = color.new(colBear, 50), style = plot.style_stepline, linewidth = 2)
+plot(showLevels and useW ? w_sl : na, "Weekly swing low", color = color.new(colBull, 50), style = plot.style_stepline, linewidth = 2)
+plot(showLevels and useM ? m_sh : na, "Monthly swing high", color = color.new(colBear, 70), style = plot.style_stepline, linewidth = 3)
+plot(showLevels and useM ? m_sl : na, "Monthly swing low", color = color.new(colBull, 70), style = plot.style_stepline, linewidth = 3)
+
+bgcolor(showBg and best.status == 2 ? color.new(best.dir == 1 ? colBull : colBear, 93) : na)
+
+// ───────────────────────── Table ─────────────────────────
+var table tb = table.new(position.top_right, 2, 10, border_width = 1, frame_color = color.gray, border_color = color.gray)
+
+if barstate.islast and showTable
+    color bc = live ? (best.dir == 1 ? colBull : colBear) : color.gray
+    string biasTxt = live ? (best.dir == 1 ? "BULLISH" : "BEARISH") : "NEUTRAL"
+    string tgtTxt = (live or best.status == 4) and not na(best.tgt) ? best.tgtName + " @ " + str.tostring(best.tgt, format.mintick) : "-"
+    string invTxt = live and not na(best.inval) ? str.tostring(best.inval, format.mintick) : "-"
+    string alnTxt = live ? best.tfName + " swing > MSS " + best.mtfTxt : "-"
+    bool warn = chartSec > 86400
+    string chkTxt = warn ? "Chart above Daily - lower it" : "OK"
+
+    color dCol = not useD ? color.gray : (eD.status == 1 or eD.status == 2 ? (eD.dir == 1 ? colBull : colBear) : #1e222d)
+    color wCol = not useW ? color.gray : (eW.status == 1 or eW.status == 2 ? (eW.dir == 1 ? colBull : colBear) : #1e222d)
+    color mCol = not useM ? color.gray : (eM.status == 1 or eM.status == 2 ? (eM.dir == 1 ? colBull : colBear) : #1e222d)
+
+    table.cell(tb, 0, 0, "Bias", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
     table.cell(tb, 1, 0, biasTxt, text_color = color.white, bgcolor = bc, text_halign = text.align_left)
     table.cell(tb, 0, 1, "Status", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
-    table.cell(tb, 1, 1, stTxt, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
+    table.cell(tb, 1, 1, live or best.status > 2 ? f_stTxt(best) : "Waiting for sweep / IRL tap", text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
     table.cell(tb, 0, 2, "Last event", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
-    table.cell(tb, 1, 2, evtTxt, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
+    table.cell(tb, 1, 2, best.evtTxt, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
     table.cell(tb, 0, 3, "Alignment", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
-    table.cell(tb, 1, 3, liqName + " > MTF " + mtfTf, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
+    table.cell(tb, 1, 3, alnTxt, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
     table.cell(tb, 0, 4, "Target", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
     table.cell(tb, 1, 4, tgtTxt, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
     table.cell(tb, 0, 5, "Invalidation", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
     table.cell(tb, 1, 5, invTxt, text_color = color.white, bgcolor = #1e222d, text_halign = text.align_left)
-    table.cell(tb, 0, 6, "Check", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
-    table.cell(tb, 1, 6, chkTxt, text_color = color.white, bgcolor = warnTf ? color.orange : #1e222d, text_halign = text.align_left)
+    table.cell(tb, 0, 6, "Daily swings", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
+    table.cell(tb, 1, 6, f_shortTxt(eD, useD), text_color = color.white, bgcolor = dCol, text_halign = text.align_left)
+    table.cell(tb, 0, 7, "Weekly swings", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
+    table.cell(tb, 1, 7, f_shortTxt(eW, useW), text_color = color.white, bgcolor = wCol, text_halign = text.align_left)
+    table.cell(tb, 0, 8, "Monthly swings", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
+    table.cell(tb, 1, 8, f_shortTxt(eM, useM), text_color = color.white, bgcolor = mCol, text_halign = text.align_left)
+    table.cell(tb, 0, 9, "Check", text_color = color.white, bgcolor = #2a2e39, text_halign = text.align_left)
+    table.cell(tb, 1, 9, chkTxt, text_color = color.white, bgcolor = warn ? color.orange : #1e222d, text_halign = text.align_left)
 
 // ───────────────────────── Alerts ─────────────────────────
-alertcondition(fEvent, "ICT Bias: liquidity event", "ICT Bias: ERL sweep or IRL tap detected on {{ticker}}")
-alertcondition(fConfBull, "ICT Bias: bullish confirmed", "ICT Bias: BULLISH confirmed by MTF MSS on {{ticker}}")
-alertcondition(fConfBear, "ICT Bias: bearish confirmed", "ICT Bias: BEARISH confirmed by MTF MSS on {{ticker}}")
-alertcondition(fInval, "ICT Bias: invalidated", "ICT Bias: bias invalidated on {{ticker}}")
+bool aEvent = eD.fEvent or eW.fEvent or eM.fEvent
+bool aBull  = eD.fBull or eW.fBull or eM.fBull
+bool aBear  = eD.fBear or eW.fBear or eM.fBear
+bool aInval = eD.fInval or eW.fInval or eM.fInval
+
+alertcondition(aEvent, "ICT Bias: liquidity event", "ICT Bias: ERL sweep or IRL tap detected on {{ticker}}")
+alertcondition(aBull, "ICT Bias: bullish confirmed", "ICT Bias: BULLISH confirmed by MSS on {{ticker}}")
+alertcondition(aBear, "ICT Bias: bearish confirmed", "ICT Bias: BEARISH confirmed by MSS on {{ticker}}")
+alertcondition(aInval, "ICT Bias: invalidated", "ICT Bias: bias invalidated on {{ticker}}")
